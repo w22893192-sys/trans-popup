@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 """trans-popup — select text in terminal → Chinese translation popup"""
 
-import subprocess, threading, time, re, signal, json
+import subprocess, threading, time, re, signal, json, os
 from urllib.request import urlopen
 from urllib.parse import quote
 from Xlib import display as _xlib_display
@@ -42,49 +42,91 @@ def get_selection():
             pass
     return ""
 
-def is_english(text):
-    if not text or len(text.split()) > 80:
-        return False
-    ascii_alpha = sum(1 for c in text if c.isascii() and c.isalpha())
-    total_alpha = sum(1 for c in text if c.isalpha())
-    return total_alpha > 0 and ascii_alpha / total_alpha > 0.7
+def contains_chinese(text):
+    return any('\u4e00' <= c <= '\u9fff' for c in text)
 
-_cache = {}
+def should_translate(text):
+    if not text or len(text) > 1000:
+        return False
+    # Must contain at least one letter (supports English, Chinese, Japanese, etc. but filters out pure numbers/punctuation)
+    return any(c.isalpha() for c in text)
+
+# --- Persistent Local Cache System ---
+CACHE_DIR = os.path.expanduser("~/.cache/trans-popup")
+CACHE_FILE = os.path.join(CACHE_DIR, "cache.json")
+_cache_lock = threading.Lock()
+
+def load_cache():
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            pass
+    return {}
+
+_cache = load_cache()
+
+def save_cache():
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with _cache_lock:
+            temp_cache = _cache.copy()
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(temp_cache, f, ensure_ascii=False, indent=2)
+    except:
+        pass
 
 def translate(text):
     key = text.lower().strip()
-    if key in _cache:
-        return _cache[key]
+    with _cache_lock:
+        if key in _cache:
+            return _cache[key]
+    
     result = _translate_api(text)
-    _cache[key] = result
-    if len(_cache) > 500:
-        for k in list(_cache)[:100]:
-            del _cache[k]
+    
+    with _cache_lock:
+        _cache[key] = result
+        if len(_cache) > 2000:
+            # Drop oldest 200 entries to save disk space
+            for k in list(_cache)[:200]:
+                del _cache[k]
+    # Asynchronously save to avoid blocking execution
+    threading.Thread(target=save_cache, daemon=True).start()
     return result
 
 def _translate_api(text):
-    try:
-        url = (f"https://translate.googleapis.com/translate_a/single"
-               f"?client=gtx&sl=en&tl=zh-CN&dt=t&q={quote(text)}")
-        with urlopen(url, timeout=8) as r:
-            data = json.loads(r.read())
-        zh = "".join(seg[0] for seg in data[0] if seg[0])
-        return zh or "—", ""
-    except:
-        return "—", ""
+    tl = "en" if contains_chinese(text) else "zh-CN"
+    # Auto-fallback mirror domains for reliability and speed inside China
+    urls = [
+        f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={tl}&dt=t&q={quote(text)}",
+        f"https://translate.google.com/translate_a/single?client=gtx&sl=auto&tl={tl}&dt=t&q={quote(text)}"
+    ]
+    for url in urls:
+        try:
+            with urlopen(url, timeout=3.0) as r:
+                data = json.loads(r.read())
+            zh = "".join(seg[0] for seg in data[0] if seg[0])
+            if zh:
+                return zh, ""
+        except Exception:
+            continue
+    return "—", ""
 
 def speak(text):
     try:
         from gtts import gTTS
         import tempfile, os
-        tts = gTTS(text=text, lang='en', slow=True)
+        lang = 'zh-CN' if contains_chinese(text) else 'en'
+        tts = gTTS(text=text, lang=lang, slow=True)
         with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as f:
             tmp = f.name
         tts.save(tmp)
         subprocess.run(['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', tmp])
         os.unlink(tmp)
     except Exception:
-        subprocess.Popen(['spd-say', '-l', 'en', text],
+        lang_say = 'zh' if contains_chinese(text) else 'en'
+        subprocess.Popen(['spd-say', '-l', lang_say, text],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 def mouse_pos():
@@ -96,21 +138,25 @@ def mouse_pos():
         return 300, 300
 
 def make_speaker_icon(orig):
+    """Cairo line-drawn speaker icon, 24x24, white strokes."""
     da = Gtk.DrawingArea()
     da.set_size_request(22, 22)
 
     def draw(widget, cr):
         cr.set_source_rgb(1, 1, 1)
         cr.set_line_width(1.8)
-        cr.set_line_cap(1)
-        cr.set_line_join(1)
+        cr.set_line_cap(1)   # ROUND
+        cr.set_line_join(1)  # ROUND
+        # speaker body
         cr.rectangle(3, 8, 5, 8)
         cr.stroke()
+        # horn
         cr.move_to(8, 8)
         cr.line_to(14, 4)
         cr.line_to(14, 20)
         cr.line_to(8, 16)
         cr.stroke()
+        # sound waves
         for r in (3.5, 6.0):
             cr.arc(16, 12, r, -0.65, 0.65)
             cr.stroke()
@@ -134,6 +180,7 @@ class Popup(Gtk.Window):
         self.set_keep_above(True)
         self.set_skip_taskbar_hint(True)
         self.set_skip_pager_hint(True)
+        # override-redirect bypasses compositor completely — no shadow
         self.connect("realize", lambda w: w.get_window().set_override_redirect(True))
 
         screen = self.get_screen()
@@ -151,12 +198,12 @@ class Popup(Gtk.Window):
         row.set_margin_start(14); row.set_margin_end(10)
         row.set_valign(Gtk.Align.CENTER)
 
-        trans_lbl = Gtk.Label(label=zh)
-        trans_lbl.set_name("trans")
-        trans_lbl.set_halign(Gtk.Align.START)
-        trans_lbl.set_line_wrap(True)
-        trans_lbl.set_max_width_chars(36)
-        row.pack_start(trans_lbl, True, True, 0)
+        self.trans_lbl = Gtk.Label(label=zh)
+        self.trans_lbl.set_name("trans")
+        self.trans_lbl.set_halign(Gtk.Align.START)
+        self.trans_lbl.set_line_wrap(True)
+        self.trans_lbl.set_max_width_chars(36)
+        row.pack_start(self.trans_lbl, True, True, 0)
         row.pack_end(make_speaker_icon(orig), False, False, 0)
 
         card.add(row)
@@ -168,6 +215,9 @@ class Popup(Gtk.Window):
 
         GLib.timeout_add(5000, lambda: self.destroy() or False)
         self.show_all()
+
+    def update_text(self, new_zh):
+        self.trans_lbl.set_text(new_zh)
 
 
 class Daemon:
@@ -182,33 +232,114 @@ class Daemon:
     def _loop(self):
         while True:
             time.sleep(0.12)
+
             if mouse_held():
                 continue
+
             text = get_selection()
-            if text == self.last or not is_english(text):
+            if not text or text == self.last or not should_translate(text):
                 continue
+
             self.last = text
             x, y = mouse_pos()
-            fut = {}
-            t = text
-            threading.Thread(target=lambda: fut.update(
-                zip(('zh','pron'), translate(t))), daemon=True).start()
-            time.sleep(0.12)
-            if get_selection() != text or mouse_held():
-                continue
-            deadline = time.time() + 10
-            while 'zh' not in fut and time.time() < deadline:
-                time.sleep(0.05)
-            if 'zh' in fut:
-                GLib.idle_add(self._show, text, fut['zh'], fut.get('pron',''), x, y)
 
-    def _show(self, orig, zh, pron, x, y):
+            # 1. Instantly display loading pop-up in main thread
+            GLib.idle_add(self._show_loading, text, x, y)
+
+            # 2. Debounce and retrieve translation in background thread
+            def trigger_translation(t):
+                time.sleep(0.15)
+                if mouse_held():
+                    GLib.idle_add(self._safe_destroy)
+                    return
+
+                zh_res, _ = translate(t)
+                GLib.idle_add(self._safe_update, zh_res)
+
+            threading.Thread(target=trigger_translation, args=(text,), daemon=True).start()
+
+    def _show_loading(self, orig, x, y):
         if self.popup:
             try: self.popup.destroy()
             except: pass
-        self.popup = Popup(orig, zh, pron, x, y)
+        self.popup = Popup(orig, "...", "", x, y)
+
+    def _safe_update(self, zh):
+        if self.popup:
+            try:
+                self.popup.update_text(zh)
+            except Exception:
+                pass
+
+    def _safe_destroy(self):
+        if self.popup:
+            try:
+                self.popup.destroy()
+                self.popup = None
+            except Exception:
+                pass
+
+
+def run_ocr_translation():
+    import os, tempfile
+    
+    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+        tmp_img = f.name
+    
+    try:
+        # 1. Capture screen area using maim
+        r = subprocess.run(['maim', '-s', tmp_img], capture_output=True)
+        if r.returncode != 0:
+            return
+        
+        x, y = mouse_pos()
+        win = None
+        
+        def start_ocr_process():
+            nonlocal win
+            # 2. Optimize tesseract using --psm 3 and redirect stderr to reduce latency
+            r_ocr = subprocess.run(
+                ['tesseract', tmp_img, 'stdout', '-l', 'chi_sim+eng', '--psm', '3'],
+                capture_output=True, text=True
+            )
+            text = r_ocr.stdout.strip()
+            
+            if not text:
+                GLib.idle_add(lambda: win.destroy() or Gtk.main_quit())
+                return
+            
+            text = re.sub(r'\s+', ' ', text).strip()
+            if not should_translate(text):
+                GLib.idle_add(lambda: win.destroy() or Gtk.main_quit())
+                return
+            
+            # Switch view to loading state
+            GLib.idle_add(win.update_text, "...")
+            zh, _ = translate(text)
+            
+            # Update to final translation
+            GLib.idle_add(win.update_text, zh)
+        
+        # Instantly show "OCR-ing" popup in UI thread
+        win = Popup("", "正在识别...", "", x, y)
+        win.connect("destroy", lambda *_: Gtk.main_quit())
+        
+        # Async run OCR to prevent blocking UI rendering
+        threading.Thread(target=start_ocr_process, daemon=True).start()
+        Gtk.main()
+    finally:
+        if os.path.exists(tmp_img):
+            try:
+                os.unlink(tmp_img)
+            except:
+                pass
 
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, lambda *_: Gtk.main_quit())
-    Daemon().start()
+    
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--ocr":
+        run_ocr_translation()
+    else:
+        Daemon().start()
