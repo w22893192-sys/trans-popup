@@ -121,20 +121,20 @@ def _translate_api(text):
             continue
     return "—", ""
 
-def speak(text):
+def speak_english(text):
     try:
         from gtts import gTTS
         import tempfile, os
-        lang = 'zh-CN' if contains_chinese(text) else 'en'
-        tts = gTTS(text=text, lang=lang, slow=True)
+        # Use English voice to speak English words standardly
+        tts = gTTS(text=text, lang='en', slow=False)
         with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as f:
             tmp = f.name
         tts.save(tmp)
         subprocess.run(['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', tmp])
         os.unlink(tmp)
     except Exception:
-        lang_say = 'zh' if contains_chinese(text) else 'en'
-        subprocess.Popen(['spd-say', '-l', lang_say, text],
+        # Fallback to local standard English speech engine
+        subprocess.Popen(['spd-say', '-l', 'en', text],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 def mouse_pos():
@@ -230,8 +230,13 @@ class Popup(Gtk.Window):
         eb.set_vexpand(False)
         eb.add(da)
         eb.connect("button-press-event",
-                   lambda *_: threading.Thread(target=speak, args=(self.orig,), daemon=True).start() or True)
+                   lambda *_: threading.Thread(target=self._speak_english, daemon=True).start() or True)
         return eb
+
+    def _speak_english(self):
+        # Speak the English translation if original text is Chinese, otherwise speak the original English
+        target_text = self.trans_lbl.get_text() if contains_chinese(self.orig) else self.orig
+        speak_english(target_text)
 
     def update_text(self, new_zh, new_orig=None):
         self.trans_lbl.set_text(new_zh)
