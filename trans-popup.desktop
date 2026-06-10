@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=trans-popup
+Comment=划词翻译 - 划选英文即刻弹出中文翻译
+Exec=/usr/bin/python3 /home/YOUR_USER/.local/share/trans-popup/trans-popup.py
+Hidden=false
+NoDisplay=false
+X-GNOME-Autostart-enabled=true
