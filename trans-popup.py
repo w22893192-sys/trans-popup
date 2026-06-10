@@ -299,6 +299,73 @@ class Daemon:
                 pass
 
 
+def clean_ocr_text(text):
+    if not text:
+        return ""
+    
+    # 1. Split into lines, strip padding, ignore empty lines
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    if not lines:
+        return ""
+        
+    cleaned_text = ""
+    for i, line in enumerate(lines):
+        if i == 0:
+            cleaned_text = line
+            continue
+            
+        # Clean trailing hyphens in English wrap-arounds
+        if cleaned_text.endswith('-'):
+            cleaned_text = cleaned_text[:-1] + line
+        else:
+            last_char = cleaned_text[-1] if cleaned_text else ""
+            first_char = line[0] if line else ""
+            
+            # Detect ASCII letters/numbers on both sides
+            is_last_eng = last_char.isascii() and (last_char.isalnum() or last_char in ".,!?")
+            is_first_eng = first_char.isascii() and first_char.isalnum()
+            
+            # Connect English lines with space, tight-connect Chinese lines directly
+            if is_last_eng and is_first_eng:
+                cleaned_text += " " + line
+            else:
+                cleaned_text += line
+                
+    return cleaned_text.strip()
+
+
+def get_ocr_text(img_path):
+    # 1. Try RapidOCR (high accuracy, ONNX runtime, local execution)
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+        global _rapid_ocr_engine
+        if '_rapid_ocr_engine' not in globals():
+            _rapid_ocr_engine = RapidOCR()
+            
+        result, elapse = _rapid_ocr_engine(img_path)
+        if result:
+            ocr_lines = []
+            for item in result:
+                text_val = item[1].strip()
+                if text_val:
+                    ocr_lines.append(text_val)
+            return "\n".join(ocr_lines)
+    except Exception:
+        pass
+
+    # 2. Fallback to Tesseract-OCR if python bindings are missing/failed
+    try:
+        r_ocr = subprocess.run(
+            ['tesseract', img_path, 'stdout', '-l', 'chi_sim+eng', '--psm', '3'],
+            capture_output=True, text=True
+        )
+        return r_ocr.stdout.strip()
+    except Exception:
+        pass
+        
+    return ""
+
+
 def run_ocr_translation():
     import os, tempfile
     
@@ -316,18 +383,15 @@ def run_ocr_translation():
         
         def start_ocr_process():
             nonlocal win
-            # 2. Optimize tesseract using --psm 3 and redirect stderr to reduce latency
-            r_ocr = subprocess.run(
-                ['tesseract', tmp_img, 'stdout', '-l', 'chi_sim+eng', '--psm', '3'],
-                capture_output=True, text=True
-            )
-            text = r_ocr.stdout.strip()
             
+            # 2. Perform OCR (uses RapidOCR with a Tesseract fallback)
+            text = get_ocr_text(tmp_img)
             if not text:
                 GLib.idle_add(lambda: win.destroy() or Gtk.main_quit())
                 return
             
-            text = re.sub(r'\s+', ' ', text).strip()
+            # 3. Format and join lines intelligently
+            text = clean_ocr_text(text)
             if not should_translate(text):
                 GLib.idle_add(lambda: win.destroy() or Gtk.main_quit())
                 return
