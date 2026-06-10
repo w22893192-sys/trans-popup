@@ -276,6 +276,7 @@ class Daemon:
     def __init__(self):
         self.last = ""
         self.popup = None
+        self.enabled = True
 
     def start(self):
         # Start Unix Socket Server to listen to screenshot triggers (0ms cold startup)
@@ -284,9 +285,20 @@ class Daemon:
         threading.Thread(target=self._loop, daemon=True).start()
         Gtk.main()
 
+    def toggle_enabled(self):
+        self.enabled = not self.enabled
+        status_str = "已启用 🟢" if self.enabled else "已禁用 🔴"
+        try:
+            subprocess.run(['notify-send', '-t', '1500', '划词翻译', status_str])
+        except:
+            pass
+
     def _loop(self):
         while True:
             time.sleep(0.12)
+
+            if not self.enabled:
+                continue
 
             if mouse_held():
                 continue
@@ -534,6 +546,8 @@ def start_socket_server(daemon_instance):
             if data == "trigger-ocr":
                 # Safely invoke screenshot inside the running daemon session
                 GLib.idle_add(run_ocr_translation_in_daemon)
+            elif data == "toggle":
+                GLib.idle_add(daemon_instance.toggle_enabled)
             conn.close()
         except:
             time.sleep(0.5)
