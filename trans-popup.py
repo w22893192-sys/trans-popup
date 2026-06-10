@@ -30,10 +30,24 @@ def mouse_held():
 def strip_punctuation(text):
     if not text:
         return ""
-    # Replace all punctuation/symbols with a space (so "hello,world" -> "hello world" instead of "helloworld")
-    text = re.sub(r'[^\w\s一-鿿]+', ' ', text)
-    # Merge duplicate spaces and trim margins
-    return re.sub(r'\s+', ' ', text).strip()
+    
+    # Smart classification:
+    # 1. 4 or more words (for spaced languages like English)
+    # 2. Or 15 or more characters in total (for non-spaced languages like Chinese)
+    word_count = len(text.split())
+    char_count = len(text)
+    is_long_sentence = (word_count >= 4) or (char_count >= 15)
+    
+    if is_long_sentence:
+        # Keep punctuation for long sentences/paragraphs to preserve syntax and tone
+        # Just normalize spaces and newlines to keep it clean
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
+    else:
+        # Fully strip punctuation for short words/phrases to prevent cache fragmentation
+        # Replace symbols with a space to prevent word collision (e.g. "hello,world" -> "hello world")
+        text = re.sub(r'[^\w\s一-鿿]+', ' ', text)
+        return re.sub(r'\s+', ' ', text).strip()
 
 def get_selection():
     # try PRIMARY first (mouse drag), fall back to CLIPBOARD
