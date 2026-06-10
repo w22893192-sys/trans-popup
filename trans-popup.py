@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 """trans-popup — select text in terminal → Chinese translation popup"""
 
-import subprocess, threading, time, re, signal, json, os
+import subprocess, threading, time, re, signal, json, os, socket
 from urllib.request import urlopen
 from urllib.parse import quote
 from Xlib import display as _xlib_display
@@ -26,14 +26,6 @@ def mouse_held():
         return bool(_xroot.query_pointer().mask & 0x100)  # Button1Mask
     except:
         return False
-
-def strip_punctuation(text):
-    if not text:
-        return ""
-    # Replace all punctuation/symbols with a space (so "hello,world" -> "hello world" instead of "helloworld")
-    text = re.sub(r'[^\w\s一-鿿]+', ' ', text)
-    # Merge duplicate spaces and trim margins
-    return re.sub(r'\s+', ' ', text).strip()
 
 def get_selection():
     # try PRIMARY first (mouse drag), fall back to CLIPBOARD
@@ -68,6 +60,7 @@ def should_translate(text):
 # --- Persistent Local Cache System ---
 CACHE_DIR = os.path.expanduser("~/.cache/trans-popup")
 CACHE_FILE = os.path.join(CACHE_DIR, "cache.json")
+UNIX_SOCKET_PATH = os.path.join(CACHE_DIR, "trans.sock")
 _cache_lock = threading.Lock()
 
 def load_cache():
@@ -165,9 +158,10 @@ def log_ocr(text, zh):
 
 
 class Popup(Gtk.Window):
-    def __init__(self, orig, zh, pron, x, y):
+    def __init__(self, orig, zh, pron, x, y, on_destroy=None):
         super().__init__(type=Gtk.WindowType.TOPLEVEL)
         self.orig = orig  # Save the original text to allow dynamic updates
+        self.on_destroy = on_destroy
         self.set_decorated(False)
         self.set_resizable(False)
         self.set_keep_above(True)
@@ -175,6 +169,7 @@ class Popup(Gtk.Window):
         self.set_skip_pager_hint(True)
         # override-redirect bypasses compositor completely — no shadow
         self.connect("realize", lambda w: w.get_window().set_override_redirect(True))
+        self.connect("destroy", self._on_window_destroyed)
 
         screen = self.get_screen()
         provider = Gtk.CssProvider()
@@ -249,6 +244,11 @@ class Popup(Gtk.Window):
         if new_orig is not None:
             self.orig = new_orig
 
+    def _on_window_destroyed(self, *args):
+        if self.on_destroy:
+            try: self.on_destroy()
+            except: pass
+
 
 class Daemon:
     def __init__(self):
@@ -256,6 +256,9 @@ class Daemon:
         self.popup = None
 
     def start(self):
+        # Start Unix Socket Server to listen to screenshot triggers (0ms cold startup)
+        threading.Thread(target=lambda: start_socket_server(self), daemon=True).start()
+        
         threading.Thread(target=self._loop, daemon=True).start()
         Gtk.main()
 
@@ -377,6 +380,61 @@ def get_ocr_text(img_path):
     return ""
 
 
+def run_ocr_translation_in_daemon():
+    import os, tempfile
+    
+    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+        tmp_img = f.name
+    
+    try:
+        # 1. Capture screen area using maim
+        r = subprocess.run(['maim', '-s', tmp_img], capture_output=True)
+        if r.returncode != 0:
+            if os.path.exists(tmp_img):
+                os.unlink(tmp_img)
+            return
+        
+        x, y = mouse_pos()
+        # Create popup window inside Daemon (do not close GTK main loop when destroyed)
+        win = Popup("", "正在识别...", "", x, y)
+        
+        def start_ocr_process():
+            try:
+                # 2. Perform OCR (uses RapidOCR with a Tesseract fallback)
+                text = get_ocr_text(tmp_img)
+                if not text:
+                    GLib.idle_add(win.destroy)
+                    return
+                
+                # 3. Format and join lines intelligently
+                text = clean_ocr_text(text)
+                text = strip_punctuation(text)
+                if not should_translate(text):
+                    GLib.idle_add(win.destroy)
+                    return
+                
+                # Switch view to loading state
+                GLib.idle_add(win.update_text, "...")
+                zh, _ = translate(text)
+                
+                # Write OCR Log for debugging
+                log_ocr(text, zh)
+                
+                # Update to final translation and the recognized original text for speaker button
+                GLib.idle_add(lambda: win.update_text(zh, text))
+            finally:
+                if os.path.exists(tmp_img):
+                    try: os.unlink(tmp_img)
+                    except: pass
+        
+        # Async run OCR to prevent blocking UI rendering
+        threading.Thread(target=start_ocr_process, daemon=True).start()
+    except Exception:
+        if os.path.exists(tmp_img):
+            try: os.unlink(tmp_img)
+            except: pass
+
+
 def run_ocr_translation():
     import os, tempfile
     
@@ -387,50 +445,88 @@ def run_ocr_translation():
         # 1. Capture screen area using maim
         r = subprocess.run(['maim', '-s', tmp_img], capture_output=True)
         if r.returncode != 0:
+            if os.path.exists(tmp_img):
+                os.unlink(tmp_img)
             return
         
         x, y = mouse_pos()
-        win = None
+        # Create popup window (close GTK main loop when destroyed since it's a standalone client process)
+        win = Popup("", "正在识别...", "", x, y, on_destroy=Gtk.main_quit)
         
         def start_ocr_process():
-            nonlocal win
-            
-            # 2. Perform OCR (uses RapidOCR with a Tesseract fallback)
-            text = get_ocr_text(tmp_img)
-            if not text:
-                GLib.idle_add(lambda: win.destroy() or Gtk.main_quit())
-                return
-            
-            # 3. Format and join lines intelligently
-            text = clean_ocr_text(text)
-            text = strip_punctuation(text)
-            if not should_translate(text):
-                GLib.idle_add(lambda: win.destroy() or Gtk.main_quit())
-                return
-            
-            # Switch view to loading state
-            GLib.idle_add(win.update_text, "...")
-            zh, _ = translate(text)
-            
-            # Write OCR Log for debugging
-            log_ocr(text, zh)
-            
-            # Update to final translation and the recognized original text for speaker button
-            GLib.idle_add(lambda: win.update_text(zh, text))
-        
-        # Instantly show "OCR-ing" popup in UI thread
-        win = Popup("", "正在识别...", "", x, y)
-        win.connect("destroy", lambda *_: Gtk.main_quit())
+            try:
+                # 2. Perform OCR (uses RapidOCR with a Tesseract fallback)
+                text = get_ocr_text(tmp_img)
+                if not text:
+                    GLib.idle_add(win.destroy)
+                    return
+                
+                # 3. Format and join lines intelligently
+                text = clean_ocr_text(text)
+                text = strip_punctuation(text)
+                if not should_translate(text):
+                    GLib.idle_add(win.destroy)
+                    return
+                
+                # Switch view to loading state
+                GLib.idle_add(win.update_text, "...")
+                zh, _ = translate(text)
+                
+                # Write OCR Log for debugging
+                log_ocr(text, zh)
+                
+                # Update to final translation and the recognized original text for speaker button
+                GLib.idle_add(lambda: win.update_text(zh, text))
+            finally:
+                if os.path.exists(tmp_img):
+                    try: os.unlink(tmp_img)
+                    except: pass
         
         # Async run OCR to prevent blocking UI rendering
         threading.Thread(target=start_ocr_process, daemon=True).start()
         Gtk.main()
-    finally:
+    except Exception:
         if os.path.exists(tmp_img):
-            try:
-                os.unlink(tmp_img)
-            except:
-                pass
+            try: os.unlink(tmp_img)
+            except: pass
+
+
+# --- Unix Socket Server/Client to eliminate Cold Startup Latency ---
+def start_socket_server(daemon_instance):
+    os.makedirs(os.path.dirname(UNIX_SOCKET_PATH), exist_ok=True)
+    if os.path.exists(UNIX_SOCKET_PATH):
+        try: os.unlink(UNIX_SOCKET_PATH)
+        except: pass
+        
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.bind(UNIX_SOCKET_PATH)
+        s.listen(5)
+    except:
+        return
+        
+    while True:
+        try:
+            conn, _ = s.accept()
+            data = conn.recv(1024).decode().strip()
+            if data == "trigger-ocr":
+                # Safely invoke screenshot inside the running daemon session
+                GLib.idle_add(run_ocr_translation_in_daemon)
+            conn.close()
+        except:
+            time.sleep(0.5)
+
+def send_ocr_trigger():
+    if os.path.exists(UNIX_SOCKET_PATH):
+        try:
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.connect(UNIX_SOCKET_PATH)
+            client.sendall(b"trigger-ocr")
+            client.close()
+            return True
+        except:
+            pass
+    return False
 
 
 if __name__ == "__main__":
@@ -438,6 +534,9 @@ if __name__ == "__main__":
     
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "--ocr":
-        run_ocr_translation()
+        # 1. First attempt to signal the running background daemon (instant, 0ms model loading)
+        if not send_ocr_trigger():
+            # 2. Fallback to local process execution if daemon is not running
+            run_ocr_translation()
     else:
         Daemon().start()
