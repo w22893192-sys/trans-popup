@@ -27,6 +27,14 @@ def mouse_held():
     except:
         return False
 
+def strip_punctuation(text):
+    if not text:
+        return ""
+    # Replace all punctuation/symbols with a space (so "hello,world" -> "hello world" instead of "helloworld")
+    text = re.sub(r'[^\w\s一-鿿]+', ' ', text)
+    # Merge duplicate spaces and trim margins
+    return re.sub(r'\s+', ' ', text).strip()
+
 def get_selection():
     # try PRIMARY first (mouse drag), fall back to CLIPBOARD
     for sel in ('primary', 'clipboard'):
@@ -35,9 +43,7 @@ def get_selection():
                                capture_output=True, text=True, timeout=1)
             text = r.stdout.strip()
             if text:
-                # strip surrounding punctuation that got swept into selection
-                text = re.sub(r'^[^\w]+|[^\w一-鿿]+$', '', text)
-                return text
+                return strip_punctuation(text)
         except:
             pass
     return ""
@@ -397,6 +403,7 @@ def run_ocr_translation():
             
             # 3. Format and join lines intelligently
             text = clean_ocr_text(text)
+            text = strip_punctuation(text)
             if not should_translate(text):
                 GLib.idle_add(lambda: win.destroy() or Gtk.main_quit())
                 return
