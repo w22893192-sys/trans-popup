@@ -43,7 +43,15 @@ def get_selection():
     return ""
 
 def contains_chinese(text):
-    return any('\u4e00' <= c <= '\u9fff' for c in text)
+    # Count Chinese characters
+    chinese_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+    # Count English letters
+    english_chars = sum(1 for c in text if c.isascii() and c.isalpha())
+    # Only classify as Chinese if Chinese characters exceed 30% of English letters,
+    # filtering out stray Tesseract OCR noise characters in English selections.
+    if chinese_chars > 0 and (english_chars == 0 or chinese_chars / english_chars > 0.3):
+        return True
+    return False
 
 def should_translate(text):
     if not text or len(text) > 1000:
@@ -137,44 +145,23 @@ def mouse_pos():
     except:
         return 300, 300
 
-def make_speaker_icon(orig):
-    """Cairo line-drawn speaker icon, 24x24, white strokes."""
-    da = Gtk.DrawingArea()
-    da.set_size_request(22, 22)
-
-    def draw(widget, cr):
-        cr.set_source_rgb(1, 1, 1)
-        cr.set_line_width(1.8)
-        cr.set_line_cap(1)   # ROUND
-        cr.set_line_join(1)  # ROUND
-        # speaker body
-        cr.rectangle(3, 8, 5, 8)
-        cr.stroke()
-        # horn
-        cr.move_to(8, 8)
-        cr.line_to(14, 4)
-        cr.line_to(14, 20)
-        cr.line_to(8, 16)
-        cr.stroke()
-        # sound waves
-        for r in (3.5, 6.0):
-            cr.arc(16, 12, r, -0.65, 0.65)
-            cr.stroke()
-        return False
-
-    da.connect("draw", draw)
-    eb = Gtk.EventBox()
-    eb.set_valign(Gtk.Align.CENTER)
-    eb.set_vexpand(False)
-    eb.add(da)
-    eb.connect("button-press-event",
-               lambda *_: threading.Thread(target=speak, args=(orig,), daemon=True).start() or True)
-    return eb
+def log_ocr(text, zh):
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        log_file = os.path.join(CACHE_DIR, "ocr.log")
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]\n")
+            f.write(f"Original: {text}\n")
+            f.write(f"Translated: {zh}\n")
+            f.write("-" * 40 + "\n")
+    except:
+        pass
 
 
 class Popup(Gtk.Window):
     def __init__(self, orig, zh, pron, x, y):
         super().__init__(type=Gtk.WindowType.TOPLEVEL)
+        self.orig = orig  # Save the original text to allow dynamic updates
         self.set_decorated(False)
         self.set_resizable(False)
         self.set_keep_above(True)
@@ -204,7 +191,7 @@ class Popup(Gtk.Window):
         self.trans_lbl.set_line_wrap(True)
         self.trans_lbl.set_max_width_chars(36)
         row.pack_start(self.trans_lbl, True, True, 0)
-        row.pack_end(make_speaker_icon(orig), False, False, 0)
+        row.pack_end(self.make_speaker_icon(), False, False, 0)
 
         card.add(row)
         self.add(card)
@@ -216,8 +203,40 @@ class Popup(Gtk.Window):
         GLib.timeout_add(5000, lambda: self.destroy() or False)
         self.show_all()
 
-    def update_text(self, new_zh):
+    def make_speaker_icon(self):
+        da = Gtk.DrawingArea()
+        da.set_size_request(22, 22)
+
+        def draw(widget, cr):
+            cr.set_source_rgb(1, 1, 1)
+            cr.set_line_width(1.8)
+            cr.set_line_cap(1)   # ROUND
+            cr.set_line_join(1)  # ROUND
+            cr.rectangle(3, 8, 5, 8)
+            cr.stroke()
+            cr.move_to(8, 8)
+            cr.line_to(14, 4)
+            cr.line_to(14, 20)
+            cr.line_to(8, 16)
+            cr.stroke()
+            for r in (3.5, 6.0):
+                cr.arc(16, 12, r, -0.65, 0.65)
+                cr.stroke()
+            return False
+
+        da.connect("draw", draw)
+        eb = Gtk.EventBox()
+        eb.set_valign(Gtk.Align.CENTER)
+        eb.set_vexpand(False)
+        eb.add(da)
+        eb.connect("button-press-event",
+                   lambda *_: threading.Thread(target=speak, args=(self.orig,), daemon=True).start() or True)
+        return eb
+
+    def update_text(self, new_zh, new_orig=None):
         self.trans_lbl.set_text(new_zh)
+        if new_orig is not None:
+            self.orig = new_orig
 
 
 class Daemon:
@@ -317,8 +336,11 @@ def run_ocr_translation():
             GLib.idle_add(win.update_text, "...")
             zh, _ = translate(text)
             
-            # Update to final translation
-            GLib.idle_add(win.update_text, zh)
+            # Write OCR Log for debugging
+            log_ocr(text, zh)
+            
+            # Update to final translation and the recognized original text for speaker button
+            GLib.idle_add(lambda: win.update_text(zh, text))
         
         # Instantly show "OCR-ing" popup in UI thread
         win = Popup("", "正在识别...", "", x, y)
