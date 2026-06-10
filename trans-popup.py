@@ -27,6 +27,14 @@ def mouse_held():
     except:
         return False
 
+def strip_punctuation(text):
+    if not text:
+        return ""
+    # Replace all punctuation/symbols with a space (so "hello,world" -> "hello world" instead of "helloworld")
+    text = re.sub(r'[^\w\s一-鿿]+', ' ', text)
+    # Merge duplicate spaces and trim margins
+    return re.sub(r'\s+', ' ', text).strip()
+
 def get_selection():
     # try PRIMARY first (mouse drag), fall back to CLIPBOARD
     for sel in ('primary', 'clipboard'):
